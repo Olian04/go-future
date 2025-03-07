@@ -171,3 +171,29 @@ func TestIterPar(t *testing.T) {
 		}
 	}
 }
+
+func Fibbonaci(n int) int {
+	if n <= 1 {
+		return n
+	}
+	return Fibbonaci(n-1) + Fibbonaci(n-2)
+}
+
+func BenchmarkIterBaseline(b *testing.B) {
+	arr := make([]int, 100_000)
+	for b.Loop() {
+		for range arr {
+			Fibbonaci(15)
+		}
+	}
+}
+
+func BenchmarkIterPar(b *testing.B) {
+	ctx := context.Background()
+	arr := make([]int, 100_000)
+	for b.Loop() {
+		future.IterPar(ctx, arr, func(ctx context.Context, val int) (int, error) {
+			return Fibbonaci(15), nil
+		})
+	}
+}
