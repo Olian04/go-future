@@ -42,7 +42,19 @@ func TestGetOr(t *testing.T) {
 		return 0, errors.New("error")
 	})
 
-	val := future.GetOr(f, func() int {
+	val := f.GetOr(ctx, 1)
+	if val != 1 {
+		t.Fatalf("expected 1, got %v", val)
+	}
+}
+
+func TestGetElse(t *testing.T) {
+	ctx := context.Background()
+	f := future.New(ctx, func(ctx context.Context) (int, error) {
+		return 0, errors.New("error")
+	})
+
+	val := f.GetElse(ctx, func() int {
 		return 1
 	})
 	if val != 1 {
@@ -60,7 +72,7 @@ func TestMustGet(t *testing.T) {
 			t.Fatalf("expected panic")
 		}
 	}()
-	future.MustGet(f)
+	f.MustGet(ctx)
 }
 
 func TestMap(t *testing.T) {
@@ -69,8 +81,8 @@ func TestMap(t *testing.T) {
 		return 1, nil
 	})
 
-	mapped := future.Map(f, func(ctx context.Context, val int) (string, error) {
-		return fmt.Sprintf("%d", val), nil
+	mapped := future.Map(f, func(ctx context.Context, val int) string {
+		return fmt.Sprintf("%d", val)
 	})
 
 	val, err := mapped.TryGet(ctx)
@@ -88,8 +100,8 @@ func TestMapError(t *testing.T) {
 		return 1, errors.New("error")
 	})
 
-	mapped := future.Map(f, func(ctx context.Context, val int) (string, error) {
-		return "", errors.New("mapped error")
+	mapped := future.MapErr(f, func(ctx context.Context, val int) error {
+		return errors.New("mapped error")
 	})
 
 	_, err := mapped.TryGet(ctx)
@@ -105,9 +117,7 @@ func TestFlatMap(t *testing.T) {
 	})
 
 	flatMapped := future.FlatMap(f, func(ctx context.Context, val int) *future.Future[string] {
-		return future.New(ctx, func(ctx context.Context) (string, error) {
-			return fmt.Sprintf("%d", val), nil
-		})
+		return future.Ok(ctx, fmt.Sprintf("%d", val))
 	})
 
 	val, err := flatMapped.TryGet(ctx)
@@ -140,5 +150,24 @@ func TestAll(t *testing.T) {
 	}
 	if all[1] != 2 {
 		t.Fatalf("expected 2, got %v", all[1])
+	}
+}
+
+func TestIterPar(t *testing.T) {
+	ctx := context.Background()
+	arr := []int{1, 2, 3, 4, 5}
+	vals, err := future.IterPar(ctx, arr, func(ctx context.Context, val int) (int, error) {
+		return val * 2, nil
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if len(vals) != 5 {
+		t.Fatalf("expected 5 values, got %v", len(vals))
+	}
+	for i, val := range vals {
+		if val != arr[i]*2 {
+			t.Fatalf("expected %d, got %v", arr[i]*2, val)
+		}
 	}
 }

@@ -4,81 +4,116 @@ import (
 	"context"
 )
 
+type State int
+
+const (
+	StatePending State = iota
+	StateDone
+	StateError
+)
+
 type Future[T any] struct {
-	fun   func(ctx context.Context) (T, error)
-	ctx   context.Context
-	valCh chan T
-	errCh chan error
+	ctx     context.Context
+	val     T
+	err     error
+	state   State
+	stateCh chan State
 }
 
-func Ok[T any](val T) *Future[T] {
-	return New(context.Background(), func(ctx context.Context) (T, error) {
-		return val, nil
-	})
+func Ok[T any](ctx context.Context, val T) *Future[T] {
+	return &Future[T]{
+		ctx:   ctx,
+		val:   val,
+		state: StateDone,
+	}
 }
 
-func Err[T any](err error) *Future[T] {
-	return New(context.Background(), func(ctx context.Context) (T, error) {
-		var defaultT T
-		return defaultT, err
-	})
+func Err[T any](ctx context.Context, err error) *Future[T] {
+	return &Future[T]{
+		ctx:   ctx,
+		err:   err,
+		state: StateError,
+	}
 }
 
 func New[T any](ctx context.Context, fun func(ctx context.Context) (T, error)) *Future[T] {
 	f := &Future[T]{
-		fun:   fun,
-		ctx:   ctx,
-		valCh: make(chan T),
-		errCh: make(chan error),
+		ctx:     ctx,
+		state:   StatePending,
+		stateCh: make(chan State),
 	}
 	go func() {
-		val, err := f.fun(f.ctx)
+		val, err := fun(f.ctx)
 		if err != nil {
-			f.errCh <- err
+			f.err = err
+			f.state = StateError
 		} else {
-			f.valCh <- val
+			f.val = val
+			f.state = StateDone
 		}
+		f.stateCh <- f.state
 	}()
 	return f
 }
 
 func (f *Future[T]) TryGet(ctx context.Context) (T, error) {
-	select {
-	case val := <-f.valCh:
-		return val, nil
-	case err := <-f.errCh:
+	if f.state == StateDone {
+		return f.val, nil
+	}
+	if f.state == StateError {
 		var defaultT T
-		return defaultT, err
-	case <-ctx.Done():
-		var defaultT T
-		return defaultT, ctx.Err()
+		return defaultT, f.err
+	}
+
+	for {
+		select {
+		case state := <-f.stateCh:
+			if state == StateDone {
+				return f.val, nil
+			}
+			if state == StateError {
+				var defaultT T
+				return defaultT, f.err
+			}
+		case <-ctx.Done():
+			var defaultT T
+			return defaultT, ctx.Err()
+		}
 	}
 }
 
-func GetOr[T any](f *Future[T], fallback func() T) T {
-	v, err := f.TryGet(context.Background())
+func (f *Future[T]) GetOr(ctx context.Context, fallback T) T {
+	v, err := f.TryGet(ctx)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func (f *Future[T]) GetElse(ctx context.Context, fallback func() T) T {
+	v, err := f.TryGet(ctx)
 	if err != nil {
 		return fallback()
 	}
 	return v
 }
 
-func MustGet[T any](f *Future[T]) T {
-	v, err := f.TryGet(context.Background())
+func (f *Future[T]) MustGet(ctx context.Context) T {
+	v, err := f.TryGet(ctx)
 	if err != nil {
 		panic(err)
 	}
 	return v
 }
 
-func Map[T any, U any](f *Future[T], fun func(ctx context.Context, val T) (U, error)) *Future[U] {
+func Map[T any, U any](f *Future[T], fun func(ctx context.Context, val T) U) *Future[U] {
 	f2 := New(f.ctx, func(ctx context.Context) (U, error) {
 		val, err := f.TryGet(ctx)
 		if err != nil {
 			var defaultU U
 			return defaultU, err
 		}
-		return fun(ctx, val)
+		return fun(ctx, val), nil
 	})
 	return f2
 }
@@ -118,41 +153,42 @@ func FlatMapErr[T any, U any](f *Future[T], fun func(ctx context.Context, val T)
 	return f2
 }
 
-func All[T any](ctx context.Context, futures []*Future[T]) ([]T, error) {
-	type futureResult[T any] struct {
-		Val   T
-		Index int
+func IterPar[T any, U any](ctx context.Context, arr []T, fun func(ctx context.Context, val T) (U, error)) ([]U, error) {
+	futures := make([]*Future[U], len(arr))
+	for i, val := range arr {
+		futures[i] = New(ctx, func(ctx context.Context) (U, error) {
+			return fun(ctx, val)
+		})
 	}
-	innerCtx, cancel := context.WithCancel(ctx)
-	valCh := make(chan futureResult[T], len(futures))
-	errCh := make(chan error)
+	return All(ctx, futures)
+}
 
-	for i, future := range futures {
+func All[T any](ctx context.Context, futures []*Future[T]) ([]T, error) {
+	doneCh := make(chan any)
+	errCh := make(chan error)
+	vals := make([]T, len(futures))
+
+	for i, f := range futures {
 		go func(f *Future[T], i int) {
-			val, err := f.TryGet(innerCtx)
+			val, err := f.TryGet(ctx)
 			if err != nil {
 				errCh <- err
 			} else {
-				valCh <- futureResult[T]{Val: val, Index: i}
+				vals[i] = val
 			}
-		}(future, i)
+			doneCh <- struct{}{}
+		}(f, i)
 	}
 
-	vals := make([]T, 0, len(futures))
-	for range len(futures) {
+	for range futures {
 		select {
-		case val := <-valCh:
-			vals[val.Index] = val.Val
+		case <-doneCh:
 		case err := <-errCh:
-			cancel()
 			return nil, err
 		case <-ctx.Done():
-			cancel()
 			return nil, ctx.Err()
 		}
 	}
-	cancel()
-	close(valCh)
-	close(errCh)
+
 	return vals, nil
 }
